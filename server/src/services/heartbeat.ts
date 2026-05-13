@@ -1029,6 +1029,50 @@ export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWork
   return [rows[preferredIndex]!, ...rows.slice(0, preferredIndex), ...rows.slice(preferredIndex + 1)];
 }
 
+/**
+ * PF-3: Build the ResolvedWorkspaceForRun shape for the case where project
+ * workspaces existed for the issue's project but none of their configured
+ * cwds were available on disk. The run uses the agent home fallback dir, so
+ * the source field reports "agent_home" — not "project_primary" — and any
+ * project-scoped metadata that does not apply to the fallback is nulled.
+ *
+ * Extracted as a pure helper so the fallback contract can be unit-tested
+ * directly. workspaceHints (the candidates considered) and warnings (why
+ * fallback was chosen) are still surfaced so operators can audit the path.
+ */
+export function buildProjectWorkspaceUnavailableFallback(input: {
+  fallbackCwd: string;
+  resolvedProjectId: string | null;
+  workspaceHints: ResolvedWorkspaceForRun["workspaceHints"];
+  warnings: string[];
+}): ResolvedWorkspaceForRun {
+  return {
+    cwd: input.fallbackCwd,
+    source: "agent_home",
+    projectId: input.resolvedProjectId,
+    workspaceId: null,
+    repoUrl: null,
+    repoRef: null,
+    workspaceHints: input.workspaceHints,
+    warnings: input.warnings,
+  };
+}
+
+export function resolveProjectWorkspaceQuerySource(input: {
+  workspaceProjectId: string | null;
+  preferredProjectWorkspaceId: string | null;
+  useProjectWorkspace: boolean;
+}):
+  | { type: "by_project_id"; projectId: string }
+  | { type: "by_workspace_id"; workspaceId: string }
+  | { type: "none" } {
+  if (!input.useProjectWorkspace) return { type: "none" };
+  if (input.workspaceProjectId) return { type: "by_project_id", projectId: input.workspaceProjectId };
+  if (input.preferredProjectWorkspaceId) {
+    return { type: "by_workspace_id", workspaceId: input.preferredProjectWorkspaceId };
+  }
+  return { type: "none" };
+}
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
@@ -1513,6 +1557,104 @@ export function resolveRuntimeSessionParamsForWorkspace(input: {
   };
 }
 
+export function resolveExplicitResumeSessionForRun(input: {
+  contextSnapshot: Record<string, unknown> | null | undefined;
+  sessionCodec: AdapterSessionCodec;
+  allowResume: boolean;
+}) {
+  if (!input.allowResume) {
+    return {
+      sessionParams: null as Record<string, unknown> | null,
+      sessionDisplayId: null as string | null,
+    };
+  }
+
+  const sessionParams = normalizeSessionParams(
+    input.sessionCodec.deserialize(parseObject(input.contextSnapshot?.resumeSessionParams)),
+  );
+  const sessionDisplayId = truncateDisplayId(
+    readNonEmptyString(input.contextSnapshot?.resumeSessionDisplayId) ??
+      (input.sessionCodec.getDisplayId ? input.sessionCodec.getDisplayId(sessionParams) : null) ??
+      readNonEmptyString(sessionParams?.sessionId),
+  );
+
+  return {
+    sessionParams,
+    sessionDisplayId,
+  };
+}
+
+export async function resolveTaskSessionWorkspaceFallbackForRun(input: {
+  agentId: string;
+  previousSessionParams: Record<string, unknown> | null;
+  resolvedProjectId: string | null;
+  workspaceHints: Array<{
+    workspaceId: string;
+    cwd: string | null;
+    repoUrl: string | null;
+    repoRef: string | null;
+  }>;
+  allowTaskSessionWorkspace: boolean;
+}): Promise<ResolvedWorkspaceForRun> {
+  const {
+    agentId,
+    previousSessionParams,
+    resolvedProjectId,
+    workspaceHints,
+    allowTaskSessionWorkspace,
+  } = input;
+  const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
+  if (allowTaskSessionWorkspace && sessionCwd) {
+    const sessionCwdExists = await fs
+      .stat(sessionCwd)
+      .then((stats) => stats.isDirectory())
+      .catch(() => false);
+    if (sessionCwdExists) {
+      return {
+        cwd: sessionCwd,
+        source: "task_session" as const,
+        projectId: resolvedProjectId,
+        workspaceId: readNonEmptyString(previousSessionParams?.workspaceId),
+        repoUrl: readNonEmptyString(previousSessionParams?.repoUrl),
+        repoRef: readNonEmptyString(previousSessionParams?.repoRef),
+        workspaceHints,
+        warnings: [],
+      };
+    }
+  }
+
+  const cwd = resolveDefaultAgentWorkspaceDir(agentId);
+  await fs.mkdir(cwd, { recursive: true });
+  const warnings: string[] = [];
+  if (sessionCwd && allowTaskSessionWorkspace) {
+    warnings.push(
+      `Saved session workspace "${sessionCwd}" is not available. Using fallback workspace "${cwd}" for this run.`,
+    );
+  } else if (sessionCwd) {
+    warnings.push(
+      `Saved session workspace "${sessionCwd}" is being ignored for this run. Using fallback workspace "${cwd}" instead.`,
+    );
+  } else if (resolvedProjectId) {
+    warnings.push(
+      `No project workspace directory is currently available for this issue. Using fallback workspace "${cwd}" for this run.`,
+    );
+  } else {
+    warnings.push(
+      `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
+    );
+  }
+  return {
+    cwd,
+    source: "agent_home" as const,
+    projectId: resolvedProjectId,
+    workspaceId: null,
+    repoUrl: null,
+    repoRef: null,
+    workspaceHints,
+    warnings,
+  };
+}
+
 function parseIssueAssigneeAdapterOverrides(
   raw: unknown,
 ): ParsedIssueAssigneeAdapterOverrides | null {
@@ -1536,13 +1678,10 @@ function parseIssueAssigneeAdapterOverrides(
 }
 
 /**
- * Synthetic task key for timer/heartbeat wakes that have no issue context.
- * This allows timer wakes to participate in the `agentTaskSessions` system
- * and benefit from robust session resume, instead of relying solely on the
- * simpler `agentRuntimeState.sessionId` fallback.
+ * Derives the issue/task key that scopes `agentTaskSessions` for a wake.
+ * Timer wakes deliberately avoid inventing a synthetic key so scheduler-driven
+ * runs can force a fresh session unless they carry an explicit task binding.
  */
-const HEARTBEAT_TASK_KEY = "__heartbeat__";
-
 function deriveTaskKey(
   contextSnapshot: Record<string, unknown> | null | undefined,
   payload: Record<string, unknown> | null | undefined,
@@ -1558,26 +1697,12 @@ function deriveTaskKey(
   );
 }
 
-/**
- * Extended task key derivation that falls back to a stable synthetic key
- * for timer/heartbeat wakes. This ensures timer wakes can resume their
- * previous session via `agentTaskSessions` instead of starting fresh.
- *
- * The synthetic key is only used when:
- * - No explicit task/issue key exists in the context
- * - The wake source is "timer" (scheduled heartbeat)
- */
 export function deriveTaskKeyWithHeartbeatFallback(
   contextSnapshot: Record<string, unknown> | null | undefined,
   payload: Record<string, unknown> | null | undefined,
 ) {
-  const explicit = deriveTaskKey(contextSnapshot, payload);
-  if (explicit) return explicit;
-
-  const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
-  if (wakeSource === "timer") return HEARTBEAT_TASK_KEY;
-
-  return null;
+  // Keep the public helper name stable for tests and downstream callers.
+  return deriveTaskKey(contextSnapshot, payload);
 }
 
 export function shouldResetTaskSessionForWake(
@@ -1585,8 +1710,16 @@ export function shouldResetTaskSessionForWake(
 ) {
   if (contextSnapshot?.forceFreshSession === true) return true;
 
+  const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
+  if (wakeSource === "timer") return true;
+
+  const legacySource = readNonEmptyString(contextSnapshot?.source);
+  const legacyReason = readNonEmptyString(contextSnapshot?.reason);
+  if (legacySource === "scheduler" && legacyReason === "interval_elapsed") return true;
+
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (
+    wakeReason === "heartbeat_timer" ||
     wakeReason === "issue_assigned" ||
     wakeReason === "execution_review_requested" ||
     wakeReason === "execution_approval_requested" ||
@@ -1595,6 +1728,38 @@ export function shouldResetTaskSessionForWake(
     return true;
   }
   return false;
+}
+
+export function applyFreshSessionPolicyToWakeContext(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+) {
+  const nextContext = { ...(contextSnapshot ?? {}) };
+  if (!shouldResetTaskSessionForWake(nextContext)) {
+    return nextContext;
+  }
+
+  const isHeartbeatTimerWake =
+    readNonEmptyString(nextContext.wakeSource) === "timer" ||
+    readNonEmptyString(nextContext.wakeReason) === "heartbeat_timer" ||
+    (
+      readNonEmptyString(nextContext.source) === "scheduler" &&
+      readNonEmptyString(nextContext.reason) === "interval_elapsed"
+    );
+
+  nextContext.forceFreshSession = true;
+  delete nextContext.resumeFromRunId;
+  delete nextContext.resumeSessionDisplayId;
+  delete nextContext.resumeSessionParams;
+  delete nextContext[PAPERCLIP_WAKE_PAYLOAD_KEY];
+  if (isHeartbeatTimerWake) {
+    delete nextContext.issueId;
+    delete nextContext.taskId;
+    delete nextContext.taskKey;
+    delete nextContext.commentId;
+    delete nextContext.wakeCommentId;
+    delete nextContext[WAKE_COMMENT_IDS_KEY];
+  }
+  return nextContext;
 }
 
 function shouldRequireIssueCommentForWake(
@@ -1876,7 +2041,7 @@ export function mergeCoalescedContextSnapshot(
   if (!hasInteractionContinuationWakeContext(incoming)) {
     clearInteractionContinuationWakeContext(merged);
   }
-  return merged;
+  return applyFreshSessionPolicyToWakeContext(merged);
 }
 
 async function buildPaperclipWakePayload(input: {
@@ -3415,7 +3580,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     context: Record<string, unknown>,
     previousSessionParams: Record<string, unknown> | null,
-    opts?: { useProjectWorkspace?: boolean | null },
+    opts?: {
+      useProjectWorkspace?: boolean | null;
+      allowTaskSessionWorkspace?: boolean | null;
+    },
   ): Promise<ResolvedWorkspaceForRun> {
     const issueId = readNonEmptyString(context.issueId);
     const contextProjectId = readNonEmptyString(context.projectId);
@@ -3437,18 +3605,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const useProjectWorkspace = opts?.useProjectWorkspace !== false;
     const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
 
-    const unorderedProjectWorkspaceRows = workspaceProjectId
-      ? await db
-          .select()
-          .from(projectWorkspaces)
-          .where(
-            and(
-              eq(projectWorkspaces.companyId, agent.companyId),
-              eq(projectWorkspaces.projectId, workspaceProjectId),
-            ),
-          )
-          .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
-      : [];
+    const workspaceQuerySource = resolveProjectWorkspaceQuerySource({
+      workspaceProjectId,
+      preferredProjectWorkspaceId,
+      useProjectWorkspace,
+    });
+    const unorderedProjectWorkspaceRows =
+      workspaceQuerySource.type === "by_project_id"
+        ? await db
+            .select()
+            .from(projectWorkspaces)
+            .where(
+              and(
+                eq(projectWorkspaces.companyId, agent.companyId),
+                eq(projectWorkspaces.projectId, workspaceQuerySource.projectId),
+              ),
+            )
+            .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+        : workspaceQuerySource.type === "by_workspace_id"
+          ? await db
+              .select()
+              .from(projectWorkspaces)
+              .where(
+                and(
+                  eq(projectWorkspaces.companyId, agent.companyId),
+                  eq(projectWorkspaces.id, workspaceQuerySource.workspaceId),
+                ),
+              )
+          : [];
     const projectWorkspaceRows = prioritizeProjectWorkspaceCandidatesForRun(
       unorderedProjectWorkspaceRows,
       preferredProjectWorkspaceId,
@@ -3536,16 +3720,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           `Project workspace has no local cwd configured. Using fallback workspace "${fallbackCwd}" for this run.`,
         );
       }
-      return {
-        cwd: fallbackCwd,
-        source: "project_primary" as const,
-        projectId: resolvedProjectId,
-        workspaceId: projectWorkspaceRows[0]?.id ?? null,
-        repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
-        repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
+      return buildProjectWorkspaceUnavailableFallback({
+        fallbackCwd,
+        resolvedProjectId,
         workspaceHints,
         warnings,
-      };
+      });
     }
 
     if (workspaceProjectId) {
@@ -3566,52 +3746,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
-    if (sessionCwd) {
-      const sessionCwdExists = await fs
-        .stat(sessionCwd)
-        .then((stats) => stats.isDirectory())
-        .catch(() => false);
-      if (sessionCwdExists) {
-        return {
-          cwd: sessionCwd,
-          source: "task_session" as const,
-          projectId: resolvedProjectId,
-          workspaceId: readNonEmptyString(previousSessionParams?.workspaceId),
-          repoUrl: readNonEmptyString(previousSessionParams?.repoUrl),
-          repoRef: readNonEmptyString(previousSessionParams?.repoRef),
-          workspaceHints,
-          warnings: [],
-        };
-      }
-    }
-
-    const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
-    await fs.mkdir(cwd, { recursive: true });
-    const warnings: string[] = [];
-    if (sessionCwd) {
-      warnings.push(
-        `Saved session workspace "${sessionCwd}" is not available. Using fallback workspace "${cwd}" for this run.`,
-      );
-    } else if (resolvedProjectId) {
-      warnings.push(
-        `No project workspace directory is currently available for this issue. Using fallback workspace "${cwd}" for this run.`,
-      );
-    } else {
-      warnings.push(
-        `No project or prior session workspace was available. Using fallback workspace "${cwd}" for this run.`,
-      );
-    }
-    return {
-      cwd,
-      source: "agent_home" as const,
-      projectId: resolvedProjectId,
-      workspaceId: null,
-      repoUrl: null,
-      repoRef: null,
+    return resolveTaskSessionWorkspaceFallbackForRun({
+      agentId: agent.id,
+      previousSessionParams,
+      resolvedProjectId,
       workspaceHints,
-      warnings,
-    };
+      allowTaskSessionWorkspace: opts?.allowTaskSessionWorkspace !== false,
+    });
   }
 
   async function upsertTaskSession(input: {
@@ -6789,7 +6930,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const runtime = await ensureRuntimeState(agent);
-    const context = parseObject(run.contextSnapshot);
+    const context = applyFreshSessionPolicyToWakeContext(parseObject(run.contextSnapshot));
     const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
@@ -6871,15 +7012,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const resetTaskSession = shouldResetTaskSessionForWake(context);
     const sessionResetReason = describeSessionResetReason(context);
     const taskSessionForRun = resetTaskSession ? null : taskSession;
-    const explicitResumeSessionParams = normalizeSessionParams(
-      sessionCodec.deserialize(parseObject(context.resumeSessionParams)),
-    );
-    const explicitResumeSessionDisplayId = truncateDisplayId(
-      readNonEmptyString(context.resumeSessionDisplayId) ??
-        (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(explicitResumeSessionParams) : null) ??
-        readNonEmptyString(explicitResumeSessionParams?.sessionId),
-    );
+    const explicitResumeSession = resolveExplicitResumeSessionForRun({
+      contextSnapshot: context,
+      sessionCodec,
+      allowResume: !resetTaskSession,
+    });
+    const explicitResumeSessionParams = explicitResumeSession.sessionParams;
+    const explicitResumeSessionDisplayId = explicitResumeSession.sessionDisplayId;
+    if (resetTaskSession) {
+      delete context.resumeFromRunId;
+      delete context.resumeSessionDisplayId;
+      delete context.resumeSessionParams;
+    }
     const previousSessionParams =
+      resetTaskSession
+        ? null
+        :
       explicitResumeSessionParams ??
       (explicitResumeSessionDisplayId ? { sessionId: explicitResumeSessionDisplayId } : null) ??
       normalizeSessionParams(sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null));
@@ -6893,7 +7041,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent,
       context,
       previousSessionParams,
-      { useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default" },
+      {
+        useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default",
+        allowTaskSessionWorkspace: !resetTaskSession,
+      },
     );
     const issueRef = issueContext
       ? {
@@ -8552,31 +8703,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       triggerDetail,
       payload,
     });
-    let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
+    const wakeContextSnapshot = applyFreshSessionPolicyToWakeContext(enrichedContextSnapshot);
+    let issueId = readNonEmptyString(wakeContextSnapshot.issueId) ?? issueIdFromPayload;
 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
-    const explicitResumeSession = await resolveExplicitResumeSessionOverride(agent, payload, taskKey);
+    const explicitResumeSession = shouldResetTaskSessionForWake(wakeContextSnapshot)
+      ? null
+      : await resolveExplicitResumeSessionOverride(agent, payload, taskKey);
     if (explicitResumeSession) {
-      enrichedContextSnapshot.resumeFromRunId = explicitResumeSession.resumeFromRunId;
-      enrichedContextSnapshot.resumeSessionDisplayId = explicitResumeSession.sessionDisplayId;
-      enrichedContextSnapshot.resumeSessionParams = explicitResumeSession.sessionParams;
-      if (!readNonEmptyString(enrichedContextSnapshot.issueId) && explicitResumeSession.issueId) {
-        enrichedContextSnapshot.issueId = explicitResumeSession.issueId;
+      wakeContextSnapshot.resumeFromRunId = explicitResumeSession.resumeFromRunId;
+      wakeContextSnapshot.resumeSessionDisplayId = explicitResumeSession.sessionDisplayId;
+      wakeContextSnapshot.resumeSessionParams = explicitResumeSession.sessionParams;
+      if (!readNonEmptyString(wakeContextSnapshot.issueId) && explicitResumeSession.issueId) {
+        wakeContextSnapshot.issueId = explicitResumeSession.issueId;
       }
-      if (!readNonEmptyString(enrichedContextSnapshot.taskId) && explicitResumeSession.taskId) {
-        enrichedContextSnapshot.taskId = explicitResumeSession.taskId;
+      if (!readNonEmptyString(wakeContextSnapshot.taskId) && explicitResumeSession.taskId) {
+        wakeContextSnapshot.taskId = explicitResumeSession.taskId;
       }
-      if (!readNonEmptyString(enrichedContextSnapshot.taskKey) && explicitResumeSession.taskKey) {
-        enrichedContextSnapshot.taskKey = explicitResumeSession.taskKey;
+      if (!readNonEmptyString(wakeContextSnapshot.taskKey) && explicitResumeSession.taskKey) {
+        wakeContextSnapshot.taskKey = explicitResumeSession.taskKey;
       }
-      issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueId;
+      issueId = readNonEmptyString(wakeContextSnapshot.issueId) ?? issueId;
     }
-    const effectiveTaskKey = readNonEmptyString(enrichedContextSnapshot.taskKey) ?? taskKey;
+    const effectiveTaskKey = readNonEmptyString(wakeContextSnapshot.taskKey) ?? taskKey;
     const sessionBefore =
       explicitResumeSession?.sessionDisplayId ??
       await resolveSessionBeforeForWakeup(agent, effectiveTaskKey);
-    const continuationAttempt = readContinuationAttempt(enrichedContextSnapshot.livenessContinuationAttempt);
+    const continuationAttempt = readContinuationAttempt(wakeContextSnapshot.livenessContinuationAttempt);
 
     const writeSkippedRequest = async (skipReason: string) => {
       await db.insert(agentWakeupRequests).values({
@@ -8594,7 +8748,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     };
 
-    let projectId = readNonEmptyString(enrichedContextSnapshot.projectId);
+    let projectId = readNonEmptyString(wakeContextSnapshot.projectId);
     if (!projectId && issueId) {
       projectId = await db
         .select({ projectId: issues.projectId })
@@ -8669,8 +8823,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return null;
         }
 
-        enrichedContextSnapshot.treeHoldInteraction = true;
-        enrichedContextSnapshot.activeTreeHold = {
+        wakeContextSnapshot.treeHoldInteraction = true;
+        wakeContextSnapshot.activeTreeHold = {
           holdId: activePauseHold.holdId,
           rootIssueId: activePauseHold.rootIssueId,
           mode: activePauseHold.mode,
@@ -8890,13 +9044,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const blockedInteractionWake =
           dependencyReadiness &&
           !dependencyReadiness.isDependencyReady &&
-          allowsIssueInteractionWake(enrichedContextSnapshot);
+          allowsIssueInteractionWake(wakeContextSnapshot);
 
         if (blockedInteractionWake) {
-          enrichedContextSnapshot.dependencyBlockedInteraction = true;
-          enrichedContextSnapshot.unresolvedBlockerIssueIds = dependencyReadiness.unresolvedBlockerIssueIds;
-          enrichedContextSnapshot.unresolvedBlockerCount = dependencyReadiness.unresolvedBlockerCount;
-          enrichedContextSnapshot.unresolvedBlockerSummaries = await listUnresolvedBlockerSummaries(
+          wakeContextSnapshot.dependencyBlockedInteraction = true;
+          wakeContextSnapshot.unresolvedBlockerIssueIds = dependencyReadiness.unresolvedBlockerIssueIds;
+          wakeContextSnapshot.unresolvedBlockerCount = dependencyReadiness.unresolvedBlockerCount;
+          wakeContextSnapshot.unresolvedBlockerSummaries = await listUnresolvedBlockerSummaries(
             tx,
             issue.companyId,
             issue.id,
@@ -8937,14 +9091,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const isSameExecutionAgent =
             Boolean(executionAgentNameKey) && executionAgentNameKey === agentNameKey;
           const shouldQueueFollowupForRunningWake =
-            shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId }) &&
+            shouldQueueFollowupForRunningIssueWake({ contextSnapshot: wakeContextSnapshot, wakeCommentId }) &&
+            activeExecutionRun.status === "running" &&
+            isSameExecutionAgent;
+          const shouldQueueFollowupForApproval =
+            reason === "approval_approved" &&
             activeExecutionRun.status === "running" &&
             isSameExecutionAgent;
 
-          if (isSameExecutionAgent && !shouldQueueFollowupForRunningWake) {
+          if (isSameExecutionAgent && !shouldQueueFollowupForRunningWake && !shouldQueueFollowupForApproval) {
             const mergedContextSnapshot = mergeCoalescedContextSnapshot(
               activeExecutionRun.contextSnapshot,
-              enrichedContextSnapshot,
+              wakeContextSnapshot,
             );
             const mergedRun = await tx
               .update(heartbeatRuns)
@@ -8978,7 +9136,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const deferredPayload = {
             ...(payload ?? {}),
             issueId,
-            [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
+            [DEFERRED_WAKE_CONTEXT_KEY]: wakeContextSnapshot,
           };
 
           const existingDeferred = await tx
@@ -9001,7 +9159,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const existingDeferredContext = parseObject(existingDeferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
             const mergedDeferredContext = mergeCoalescedContextSnapshot(
               existingDeferredContext,
-              enrichedContextSnapshot,
+              wakeContextSnapshot,
             );
             const mergedDeferredPayload = {
               ...existingDeferredPayload,
@@ -9064,7 +9222,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             triggerDetail,
             status: "queued",
             wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: enrichedContextSnapshot,
+            contextSnapshot: wakeContextSnapshot,
             sessionIdBefore: sessionBefore,
             continuationAttempt,
           })
@@ -9127,17 +9285,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const shouldQueueFollowupForRunningWake =
       Boolean(sameScopeRunningRun) &&
       !sameScopeQueuedRun &&
-      shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId });
+      shouldQueueFollowupForRunningIssueWake({ contextSnapshot: wakeContextSnapshot, wakeCommentId });
+    // approval_approved must always produce a fresh queued run so the requester
+    // agent sees and acts on the resolution. Coalescing it into a running run
+    // means the agent never re-polls approval state mid-run and the originating
+    // issue stays blocked indefinitely after the run ends.
+    const shouldQueueFollowupForApproval =
+      reason === "approval_approved" && Boolean(sameScopeRunningRun) && !sameScopeQueuedRun;
 
     const coalescedTargetRun =
       sameScopeQueuedRun ??
       sameScopeScheduledRetryRun ??
-      (shouldQueueFollowupForRunningWake ? null : sameScopeRunningRun ?? null);
+      ((shouldQueueFollowupForRunningWake || shouldQueueFollowupForApproval) ? null : sameScopeRunningRun ?? null);
 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
         coalescedTargetRun.contextSnapshot,
-        enrichedContextSnapshot,
+        wakeContextSnapshot,
       );
       const mergedRun = await db
         .update(heartbeatRuns)
@@ -9193,7 +9357,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         triggerDetail,
         status: "queued",
         wakeupRequestId: wakeupRequest.id,
-        contextSnapshot: enrichedContextSnapshot,
+        contextSnapshot: wakeContextSnapshot,
         sessionIdBefore: sessionBefore,
         continuationAttempt,
       })
