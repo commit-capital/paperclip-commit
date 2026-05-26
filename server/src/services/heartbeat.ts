@@ -9117,8 +9117,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId }) &&
             activeExecutionRun.status === "running" &&
             isSameExecutionAgent;
+          const shouldQueueFollowupForApproval =
+            reason === "approval_approved" &&
+            activeExecutionRun.status === "running" &&
+            isSameExecutionAgent;
 
-          if (isSameExecutionAgent && !shouldQueueFollowupForRunningWake) {
+          if (isSameExecutionAgent && !shouldQueueFollowupForRunningWake && !shouldQueueFollowupForApproval) {
             const mergedContextSnapshot = mergeCoalescedContextSnapshot(
               activeExecutionRun.contextSnapshot,
               enrichedContextSnapshot,
@@ -9305,11 +9309,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       Boolean(sameScopeRunningRun) &&
       !sameScopeQueuedRun &&
       shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId });
+    // approval_approved must always produce a fresh queued run so the requester
+    // agent sees and acts on the resolution. Coalescing it into a running run
+    // means the agent never re-polls approval state mid-run and the originating
+    // issue stays blocked indefinitely after the run ends.
+    const shouldQueueFollowupForApproval =
+      reason === "approval_approved" && Boolean(sameScopeRunningRun) && !sameScopeQueuedRun;
 
     const coalescedTargetRun =
       sameScopeQueuedRun ??
       sameScopeScheduledRetryRun ??
-      (shouldQueueFollowupForRunningWake ? null : sameScopeRunningRun ?? null);
+      ((shouldQueueFollowupForRunningWake || shouldQueueFollowupForApproval) ? null : sameScopeRunningRun ?? null);
 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
