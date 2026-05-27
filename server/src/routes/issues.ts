@@ -42,6 +42,7 @@ import {
   updateIssueSchema,
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
+  isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   type CompanySearchQuery,
   type CompanySearchResponse,
@@ -632,13 +633,47 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   assigneeAgentId: string | null | undefined;
   actorType: "agent" | "user";
   actorId: string;
+  actorRunId: string | null | undefined;
+  checkoutRunId: string | null | undefined;
+  executionRunId: string | null | undefined;
 }) {
+  // Local-CLI agents post comments under user auth, so the actor.type is "user"
+  // even though the comment originates from the same heartbeat run that owns
+  // the issue lock. Without this guard, an agent that closes its own issue and
+  // then posts a follow-up comment in the same run silently reopens it.
+  // Suppress the implicit move whenever the comment's source run matches the
+  // issue's checkout/execution run.
+  if (
+    typeof input.actorRunId === "string"
+    && input.actorRunId.length > 0
+    && (input.actorRunId === input.checkoutRunId || input.actorRunId === input.executionRunId)
+  ) {
+    return false;
+  }
   // Only human comments should implicitly reopen finished work.
   // Agent-authored comments remain communicative unless reopen was explicit.
   if (input.actorType !== "user") return false;
   if (!isClosedIssueStatus(input.issueStatus) && input.issueStatus !== "blocked") return false;
   if (typeof input.assigneeAgentId !== "string" || input.assigneeAgentId.length === 0) return false;
   return true;
+}
+
+// AKS-1563 (parent AKS-1562, R1): log-class comment from the assignee agent on
+// a terminal (done/cancelled) issue is not a reopen signal. Returning true here
+// forces the caller to skip reopen + skip the issue_reopened_via_comment wake,
+// even when the caller explicitly passed `reopen: true`.
+function isAssigneeSelfCommentOnTerminalIssue(input: {
+  hasCommentBody: boolean;
+  issueStatus: string | null | undefined;
+  assigneeAgentId: string | null | undefined;
+  actorType: "agent" | "user";
+  actorId: string;
+}) {
+  if (!input.hasCommentBody) return false;
+  if (!isClosedIssueStatus(input.issueStatus)) return false;
+  if (typeof input.assigneeAgentId !== "string" || input.assigneeAgentId.length === 0) return false;
+  if (input.actorType !== "agent") return false;
+  return input.actorId === input.assigneeAgentId;
 }
 
 function shouldHumanCommentResumeInProgressScheduledRetry(input: {
@@ -1823,6 +1858,8 @@ export function issueRoutes(
       ? Number.parseInt(rawOffset, 10)
       : null;
     const attention = req.query.attention as string | undefined;
+    const assigneeAgentFilterRaw = req.query.assigneeAgentId;
+    let assigneeAgentId: string | null | undefined;
     const sortField = req.query.sortField as string | undefined;
     const sortDir = req.query.sortDir as string | undefined;
 
@@ -1862,12 +1899,29 @@ export function issueRoutes(
       res.status(400).json({ error: "sortDir must be 'asc' or 'desc' when provided" });
       return;
     }
+    if (assigneeAgentFilterRaw !== undefined) {
+      if (typeof assigneeAgentFilterRaw !== "string") {
+        res.status(422).json({ error: "assigneeAgentId must be a UUID or 'null'" });
+        return;
+      }
+      const normalizedAssigneeAgentFilter = assigneeAgentFilterRaw.trim();
+      if (normalizedAssigneeAgentFilter.length === 0) {
+        assigneeAgentId = undefined;
+      } else if (normalizedAssigneeAgentFilter.toLowerCase() === "null") {
+        assigneeAgentId = null;
+      } else if (isUuidLike(normalizedAssigneeAgentFilter)) {
+        assigneeAgentId = normalizedAssigneeAgentFilter;
+      } else {
+        res.status(422).json({ error: "assigneeAgentId must be a UUID or 'null'" });
+        return;
+      }
+    }
     const offset = parsedOffset ?? 0;
 
     const result = await svc.list(companyId, {
       attention: attention === "blocked" ? "blocked" : undefined,
-      status: req.query.status as string | undefined,
-      assigneeAgentId: req.query.assigneeAgentId as string | undefined,
+      status: req.query.status as string | string[] | undefined,
+      assigneeAgentId,
       participantAgentId: req.query.participantAgentId as string | undefined,
       assigneeUserId,
       touchedByUserId,
@@ -3451,6 +3505,13 @@ export function issueRoutes(
     await assertIssueEnvironmentSelection(existing.companyId, updateFields.executionWorkspaceSettings?.environmentId);
     const requestedAssigneeAgentId =
       normalizedAssigneeAgentId === undefined ? existing.assigneeAgentId : normalizedAssigneeAgentId;
+    const assigneeSelfCommentOnTerminal = isAssigneeSelfCommentOnTerminalIssue({
+      hasCommentBody: !!commentBody,
+      issueStatus: existing.status,
+      assigneeAgentId: requestedAssigneeAgentId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+    });
     const explicitMoveToTodoRequested = reopenRequested || resumeRequested === true;
     const recoveryRelevantSourceMutationRequested =
       req.body.status !== undefined ||
@@ -3487,15 +3548,19 @@ export function issueRoutes(
       !!scheduledRetryForHumanComment &&
       scheduledRetryForHumanComment.agentId === requestedAssigneeAgentId;
     const effectiveMoveToTodoRequested =
-      explicitMoveToTodoRequested ||
-      (!!commentBody &&
-        shouldImplicitlyMoveCommentedIssueToTodo({
-          issueStatus: existing.status,
-          assigneeAgentId: requestedAssigneeAgentId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-        })) ||
-      shouldResumeInProgressScheduledRetry;
+      !assigneeSelfCommentOnTerminal &&
+      (explicitMoveToTodoRequested ||
+        (!!commentBody &&
+          shouldImplicitlyMoveCommentedIssueToTodo({
+            issueStatus: existing.status,
+            assigneeAgentId: requestedAssigneeAgentId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            actorRunId: actor.runId,
+            checkoutRunId: existing.checkoutRunId,
+            executionRunId: existing.executionRunId,
+          })) ||
+        shouldResumeInProgressScheduledRetry);
     const updateReferenceSummaryBefore = titleOrDescriptionChanged
       ? await issueReferencesSvc.listIssueReferenceSummary(existing.id)
       : null;
@@ -5142,6 +5207,13 @@ export function issueRoutes(
     }
     const isClosed = isClosedIssueStatus(issue.status);
     const isBlocked = issue.status === "blocked";
+    const assigneeSelfCommentOnTerminal = isAssigneeSelfCommentOnTerminalIssue({
+      hasCommentBody: true,
+      issueStatus: issue.status,
+      assigneeAgentId: issue.assigneeAgentId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+    });
     const explicitMoveToTodoRequested = reopenRequested || resumeRequested === true;
     const scheduledRetryForHumanComment =
       shouldHumanCommentResumeInProgressScheduledRetry({
@@ -5156,14 +5228,18 @@ export function issueRoutes(
       !!scheduledRetryForHumanComment &&
       scheduledRetryForHumanComment.agentId === issue.assigneeAgentId;
     const effectiveMoveToTodoRequested =
-      explicitMoveToTodoRequested ||
-      shouldImplicitlyMoveCommentedIssueToTodo({
-        issueStatus: issue.status,
-        assigneeAgentId: issue.assigneeAgentId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-      }) ||
-      shouldResumeInProgressScheduledRetry;
+      !assigneeSelfCommentOnTerminal &&
+      (explicitMoveToTodoRequested ||
+        shouldImplicitlyMoveCommentedIssueToTodo({
+          issueStatus: issue.status,
+          assigneeAgentId: issue.assigneeAgentId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          actorRunId: actor.runId,
+          checkoutRunId: issue.checkoutRunId,
+          executionRunId: issue.executionRunId,
+        }) ||
+        shouldResumeInProgressScheduledRetry);
     const hasUnresolvedFirstClassBlockers =
       isBlocked && effectiveMoveToTodoRequested
         ? (await svc.getDependencyReadiness(issue.id)).unresolvedBlockerCount > 0

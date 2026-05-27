@@ -133,6 +133,21 @@ function buildReusedExecutionWorkspaceConfigPatchFromIssueSettings(
   };
 }
 
+// Express's default `qs` parser binds repeated query keys to a `string[]`,
+// so a request like `?status=todo&status=in_progress` arrives here as an
+// array. Single-key + comma-separated forms (`?status=todo,in_progress`) and
+// the pure-string form (`?status=todo`) are also valid. The helper below
+// normalizes all four shapes into `string[]`; widening this field to match
+// stops the type from lying about runtime reality (see #4628).
+export function parseStatusFilter(input: string | readonly string[] | undefined): string[] {
+  if (input === undefined || input === null) return [];
+  const arr = Array.isArray(input) ? input : typeof input === "string" ? [input] : [];
+  return arr
+    .flatMap((entry) => (typeof entry === "string" ? entry.split(",") : []))
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 function toTimestampMs(value: Date | string | null | undefined) {
   if (!value) return null;
   const date = value instanceof Date ? value : new Date(value);
@@ -215,8 +230,8 @@ export function deriveIssueCommentRunLogAttribution(
 
 export interface IssueFilters {
   attention?: "blocked";
-  status?: string;
-  assigneeAgentId?: string;
+  status?: string | readonly string[];
+  assigneeAgentId?: string | null;
   participantAgentId?: string;
   assigneeUserId?: string;
   touchedByUserId?: string;
@@ -2564,11 +2579,9 @@ async function blockedInboxIssueConditions(
       )
     `);
   }
-  if (filters?.status) {
-    const statuses = filters.status.split(",").map((status) => status.trim()).filter(Boolean);
-    if (statuses.length > 0) {
-      conditions.push(statuses.length === 1 ? eq(issues.status, statuses[0]!) : inArray(issues.status, statuses));
-    }
+  const statuses = parseStatusFilter(filters?.status);
+  if (statuses.length > 0) {
+    conditions.push(statuses.length === 1 ? eq(issues.status, statuses[0]!) : inArray(issues.status, statuses));
   }
   if (filters?.assigneeAgentId) conditions.push(eq(issues.assigneeAgentId, filters.assigneeAgentId));
   if (filters?.participantAgentId) conditions.push(participatedByAgentCondition(companyId, filters.participantAgentId));
@@ -3552,11 +3565,17 @@ export function issueService(db: Db) {
           )
         `);
       }
-      if (filters?.status) {
-        const statuses = filters.status.split(",").map((s) => s.trim());
-        conditions.push(statuses.length === 1 ? eq(issues.status, statuses[0]) : inArray(issues.status, statuses));
+      if (filters?.status !== undefined) {
+        const statuses = parseStatusFilter(filters.status);
+        if (statuses.length === 1) {
+          conditions.push(eq(issues.status, statuses[0]));
+        } else if (statuses.length > 1) {
+          conditions.push(inArray(issues.status, statuses));
+        }
       }
-      if (filters?.assigneeAgentId) {
+      if (filters?.assigneeAgentId === null) {
+        conditions.push(isNull(issues.assigneeAgentId));
+      } else if (filters?.assigneeAgentId) {
         conditions.push(eq(issues.assigneeAgentId, filters.assigneeAgentId));
       }
       if (filters?.participantAgentId) {
@@ -3732,10 +3751,13 @@ export function issueService(db: Db) {
       }
 
       const conditions = [eq(issues.companyId, companyId), isNull(issues.hiddenAt)];
-      if (filters?.status) {
-        const statuses = filters.status.split(",").map((status) => status.trim()).filter(Boolean);
-        if (statuses.length === 1) conditions.push(eq(issues.status, statuses[0]!));
-        else if (statuses.length > 1) conditions.push(inArray(issues.status, statuses));
+      if (filters?.status !== undefined) {
+        const statuses = parseStatusFilter(filters.status);
+        if (statuses.length === 1) {
+          conditions.push(eq(issues.status, statuses[0]));
+        } else if (statuses.length > 1) {
+          conditions.push(inArray(issues.status, statuses));
+        }
       }
       if (filters?.assigneeAgentId) conditions.push(eq(issues.assigneeAgentId, filters.assigneeAgentId));
       if (filters?.assigneeUserId) conditions.push(eq(issues.assigneeUserId, filters.assigneeUserId));
@@ -3759,20 +3781,22 @@ export function issueService(db: Db) {
       return Number(row?.count ?? 0);
     },
 
-    countUnreadTouchedByUser: async (companyId: string, userId: string, status?: string) => {
+    countUnreadTouchedByUser: async (
+      companyId: string,
+      userId: string,
+      status?: string | readonly string[],
+    ) => {
       const conditions = [
         eq(issues.companyId, companyId),
         isNull(issues.hiddenAt),
         nonPluginOperationIssueCondition(),
         unreadForUserCondition(companyId, userId),
       ];
-      if (status) {
-        const statuses = status.split(",").map((s) => s.trim()).filter(Boolean);
-        if (statuses.length === 1) {
-          conditions.push(eq(issues.status, statuses[0]));
-        } else if (statuses.length > 1) {
-          conditions.push(inArray(issues.status, statuses));
-        }
+      const statuses = parseStatusFilter(status);
+      if (statuses.length === 1) {
+        conditions.push(eq(issues.status, statuses[0]));
+      } else if (statuses.length > 1) {
+        conditions.push(inArray(issues.status, statuses));
       }
       const [row] = await db
         .select({ count: sql<number>`count(*)` })
@@ -5035,7 +5059,8 @@ export function issueService(db: Db) {
         .update(issues)
         .set({
           status: "todo",
-          assigneeAgentId: null,
+          // Preserve assigneeAgentId so the issue stays assigned after a lock-release.
+          // Callers that genuinely want to unassign should PATCH assigneeAgentId separately.
           checkoutRunId: null,
           executionRunId: null,
           executionAgentNameKey: null,
