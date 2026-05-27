@@ -722,8 +722,12 @@ export async function startServer(): Promise<StartedServer> {
   
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
+    // Also sweep any issues whose executionRunId points to a dead run — these can
+    // accumulate when the server is killed mid-run and would otherwise block all future
+    // checkouts on those issues indefinitely.
     void heartbeat
       .reapOrphanedRuns()
+      .then(() => heartbeat.sweepStaleExecutionLocks())
       .then(() => heartbeat.promoteDueScheduledRetries())
       .then(async (promotion) => {
         await heartbeat.resumeQueuedRuns();
@@ -786,10 +790,12 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "routine scheduler tick failed");
         });
   
-      // Periodically reap orphaned runs (5-min staleness threshold) and make sure
-      // persisted queued work is still being driven forward.
+      // Periodically reap orphaned runs (5-min staleness threshold), sweep any stale
+      // execution lock fields left by dead runs, and make sure persisted queued work is
+      // still being driven forward.
       void heartbeat
         .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+        .then(() => heartbeat.sweepStaleExecutionLocks())
         .then(() => heartbeat.promoteDueScheduledRetries())
         .then(async (promotion) => {
           await heartbeat.resumeQueuedRuns();
@@ -830,8 +836,33 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "periodic heartbeat recovery failed");
         });
     }, config.heartbeatSchedulerIntervalMs);
+
+    // Sweep orphaned execution locks every 15 minutes.
+    // An orphaned lock is one whose associated run has reached a terminal state
+    // (succeeded / failed / cancelled / timed_out) or whose lock timestamp is
+    // older than 1 hour without an active run.
+    const EXECUTION_LOCK_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
+    const ORPHANED_LOCK_ALERT_THRESHOLD = Number(process.env.ORPHANED_LOCK_ALERT_THRESHOLD) || 5;
+    setInterval(() => {
+      void heartbeat
+        .sweepOrphanedExecutionLocks()
+        .then((result) => {
+          if (result.cleaned > 0) {
+            const logFn = result.cleaned >= ORPHANED_LOCK_ALERT_THRESHOLD ? logger.error : logger.warn;
+            logFn(
+              { cleanedCount: result.cleaned, issueIds: result.issueIds, alertThreshold: ORPHANED_LOCK_ALERT_THRESHOLD },
+              result.cleaned >= ORPHANED_LOCK_ALERT_THRESHOLD
+                ? `ALERT: swept ${result.cleaned} orphaned execution locks (>= threshold ${ORPHANED_LOCK_ALERT_THRESHOLD})`
+                : `swept ${result.cleaned} orphaned execution locks`,
+            );
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "orphaned execution lock sweep failed");
+        });
+    }, EXECUTION_LOCK_SWEEP_INTERVAL_MS);
   }
-  
+
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
 
