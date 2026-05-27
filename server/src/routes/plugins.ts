@@ -60,6 +60,7 @@ import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sd
 import {
   assertAuthenticated,
   assertBoard,
+  assertBoardOrAgent,
   assertBoardOrgAccess,
   assertCompanyAccess,
   assertInstanceAdmin,
@@ -769,7 +770,7 @@ export function pluginRoutes(
    * Errors: 501 if tool dispatcher is not configured
    */
   router.get("/plugins/tools", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertBoardOrAgent(req);
 
     if (!toolDeps) {
       res.status(501).json({ error: "Plugin tool dispatch is not enabled" });
@@ -803,7 +804,7 @@ export function pluginRoutes(
    * - 502 if the plugin worker is unavailable or the RPC call fails
    */
   router.post("/plugins/tools/execute", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertBoardOrAgent(req);
 
     if (!toolDeps) {
       res.status(501).json({ error: "Plugin tool dispatch is not enabled" });
