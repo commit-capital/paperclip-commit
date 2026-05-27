@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -6811,6 +6811,72 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileIssueGraphLiveness(opts);
   }
 
+  /**
+   * Sweep execution locks that have become orphaned: the associated run is in a
+   * terminal state (`succeeded`, `failed`, `cancelled`, `timed_out`) OR the lock
+   * has been held for longer than `staleThresholdMs` (default: 1 hour) without an
+   * active run. Clears `executionRunId`, `executionAgentNameKey`, and
+   * `executionLockedAt` on affected issues and returns a summary.
+   */
+  async function sweepOrphanedExecutionLocks(opts?: { staleThresholdMs?: number }) {
+    const staleThresholdMs = opts?.staleThresholdMs ?? 60 * 60 * 1000; // 1 hour
+    const staleCutoff = new Date(Date.now() - staleThresholdMs);
+
+    // Find issues with a populated executionRunId whose run is terminal OR whose
+    // lock timestamp is stale (fallback for runs whose records may be missing).
+    const candidates = await db
+      .select({
+        issueId: issues.id,
+        companyId: issues.companyId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+        runStatus: heartbeatRuns.status,
+      })
+      .from(issues)
+      .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, issues.executionRunId))
+      .where(
+        and(
+          isNotNull(issues.executionRunId),
+          or(
+            inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out"]),
+            // Lock held without an active run for longer than the stale threshold
+            and(
+              lt(issues.executionLockedAt, staleCutoff),
+              or(
+                sql`${heartbeatRuns.id} IS NULL`,
+                sql`${heartbeatRuns.status} NOT IN ('queued', 'running')`,
+              ),
+            ),
+          ),
+        ),
+      );
+
+    if (candidates.length === 0) {
+      return { cleaned: 0, issueIds: [] };
+    }
+
+    // Update per-row, verifying executionRunId still matches the candidate snapshot
+    // to avoid a TOCTOU race where a new run acquires the lock between SELECT and UPDATE.
+    const updateResults = await Promise.all(
+      candidates.map((c) =>
+        db
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(issues.id, c.issueId), eq(issues.executionRunId, c.executionRunId!)))
+          .returning({ id: issues.id }),
+      ),
+    );
+
+    const clearedIssueIds = updateResults.flatMap((r) => r.map((row) => row.id));
+
+    return { cleaned: clearedIssueIds.length, issueIds: clearedIssueIds };
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -8462,10 +8528,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
         const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
+        // Local-CLI agents post comments under user auth, so a self-comment from
+        // the run that is now ending would otherwise look like a real human
+        // comment and trigger a reopen on the very issue this run just closed.
+        // Suppress reopen when at least one referenced comment was authored by
+        // this same run.
+        let deferredCommentWakeIsSelfAuthored = false;
+        if (deferredCommentIds.length > 0) {
+          const sameRunSelfComment = await tx
+            .select({ id: issueComments.id })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, issue.companyId),
+                eq(issueComments.issueId, issue.id),
+                eq(issueComments.createdByRunId, run.id),
+                inArray(issueComments.id, deferredCommentIds),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          deferredCommentWakeIsSelfAuthored = sameRunSelfComment !== null;
+        }
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =
           deferredCommentIds.length > 0 &&
+          !deferredCommentWakeIsSelfAuthored &&
           (issue.status === "done" || issue.status === "cancelled") &&
           (
             deferred.requestedByActorType === "user" ||
@@ -9984,6 +10073,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     resumeQueuedRuns,
 
+    sweepOrphanedExecutionLocks,
+
     scheduleBoundedRetry: async (
       runId: string,
       opts?: {
@@ -10060,6 +10151,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
 
     cancelBudgetScopeWork,
+
+    /**
+     * Sweep all issues whose executionRunId points to a terminal or missing run and clear
+     * the stale execution lock fields.  Should be called once on server startup and
+     * periodically (e.g. every 5 minutes) via the scheduler so that issues stuck by a
+     * crashed run are automatically unblocked without requiring manual intervention.
+     *
+     * This complements reapOrphanedRuns() (which handles in-memory running processes) by
+     * catching the persistence-level case where the DB row was never cleaned up — e.g.
+     * when the server was killed mid-run, when a run was cancelled while the issue lock
+     * was already set, or when the release() call was skipped due to a code path bug.
+     */
+    sweepStaleExecutionLocks: async () => {
+      const TERMINAL_STATUSES = ["succeeded", "failed", "timed_out", "cancelled", "process_lost"];
+
+      // Find issues with an executionRunId that is either missing or terminal.
+      const staleIssues = await db.execute(sql`
+        SELECT i.id, i.identifier, i.execution_run_id
+        FROM issues i
+        WHERE i.execution_run_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM heartbeat_runs hr
+            WHERE hr.id = i.execution_run_id
+              AND hr.status NOT IN (${sql.join(TERMINAL_STATUSES.map((s) => sql`${s}`), sql`, `)})
+          )
+      `);
+
+      if (staleIssues.length === 0) return { cleared: 0 };
+
+      const staleIds = staleIssues.map((r: Record<string, unknown>) => r.id as string);
+
+      await db
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(inArray(issues.id, staleIds));
+
+      logger.info(
+        { count: staleIds.length, issueIds: staleIds },
+        "swept stale execution locks from issues pointing to terminal/missing runs",
+      );
+
+      return { cleared: staleIds.length };
+    },
 
     getRunIssueSummary: async (runId: string) => {
       const [run] = await db
