@@ -16,8 +16,9 @@ import {
   heartbeatRunEvents,
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
-  issueComments,
   issueApprovals,
+  issueAttachments,
+  issueComments,
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
@@ -70,6 +71,19 @@ const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+
+// GGU-809: when a stranded `in_progress` issue would otherwise hit the
+// `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
+// escalation if the assignee posted a comment or attachment within this window.
+// Batch workflows (e.g. Image Spec multi-frame generation) make real progress
+// every heartbeat and would otherwise trigger a recovery issue after just two
+// productive heartbeats. Floor the override at 60s to keep the exemption from
+// being effectively disabled by misconfiguration.
+export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
+  60_000,
+  Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MS) || 30 * 60 * 1000,
+);
+
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -500,6 +514,47 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => Boolean(rows[0]));
   }
 
+  // GGU-809: visible-progress signal for stranded-recovery escalation guard.
+  // Returns true if the assignee posted a comment, OR any attachment was added
+  // to the issue, within `windowMs`. Used to suppress false-positive recovery
+  // issues for batch workflows that genuinely advance every heartbeat.
+  async function hasRecentVisibleProgress(
+    companyId: string,
+    issueId: string,
+    assigneeAgentId: string,
+    windowMs: number,
+  ) {
+    const since = new Date(Date.now() - windowMs);
+    const [comment, attachment] = await Promise.all([
+      db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, companyId),
+            eq(issueComments.issueId, issueId),
+            eq(issueComments.authorAgentId, assigneeAgentId),
+            gt(issueComments.createdAt, since),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: issueAttachments.id })
+        .from(issueAttachments)
+        .where(
+          and(
+            eq(issueAttachments.companyId, companyId),
+            eq(issueAttachments.issueId, issueId),
+            gt(issueAttachments.createdAt, since),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+    return Boolean(comment || attachment);
+  }
+
   async function enqueueStrandedIssueRecovery(input: {
     issueId: string;
     agentId: string;
@@ -734,6 +789,45 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
       .limit(1);
     return row ?? null;
+  }
+
+  // Returns a closed (done/cancelled) stale-run evaluation issue for this run if one exists.
+  // Used to detect when a reviewer closed an alert directly on the board without going through
+  // the watchdog decision API — which would not leave a dismissed_false_positive decision record.
+  async function findClosedStaleRunEvaluation(companyId: string, runId: string) {
+    const [row] = await db
+      .select({ id: issues.id, identifier: issues.identifier, status: issues.status })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
+          eq(issues.originId, runId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  // Returns true when a reviewer has already dismissed this run's silence as a false positive.
+  // Used to prevent re-filing after a deliberate close — while still allowing legitimate
+  // re-arm after a "continue" decision's snooze window expires.
+  async function hasDismissedFalsePositiveDecision(companyId: string, runId: string) {
+    const [row] = await db
+      .select({ id: heartbeatRunWatchdogDecisions.id })
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, runId),
+          eq(heartbeatRunWatchdogDecisions.decision, "dismissed_false_positive"),
+        ),
+      )
+      .limit(1);
+    return row != null;
   }
 
   async function findOpenStaleRunEvaluation(companyId: string, runId: string) {
@@ -1330,20 +1424,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     run: typeof heartbeatRuns.$inferSelect;
   }) {
     if (!input.sourceIssue || ["done", "cancelled"].includes(input.sourceIssue.status)) return false;
-    const blockerIds = await existingBlockerIssueIds(input.sourceIssue.companyId, input.sourceIssue.id);
-    if (blockerIds.includes(input.evaluationIssue.id)) return false;
-    const nextBlockerIds = [...blockerIds, input.evaluationIssue.id];
-    await issuesSvc.update(input.sourceIssue.id, {
-      ...(input.sourceIssue.status === "blocked" ? {} : { status: "blocked" }),
-      blockedByIssueIds: nextBlockerIds,
-    });
+    // Evaluation issues are observability-only — do NOT add them to blockedByIssueIds.
+    // They are already parented under the source issue. Adding them as hard blockers
+    // creates a self-amplifying loop: block → silence → new alert → block again.
     await issuesSvc.addComment(input.sourceIssue.id, [
       "Paperclip detected critical output silence on this issue's active run.",
       "",
       `- Evaluation issue: ${input.evaluationIssue.identifier ?? input.evaluationIssue.id}`,
       `- Run: \`${input.run.id}\``,
       "",
-      "This blocks the source issue on the explicit review task without cancelling the active process.",
+      "Review the evaluation issue above. The active run has not been cancelled.",
     ].join("\n"), { runId: input.run.id });
     await logActivity(db, {
       companyId: input.sourceIssue.companyId,
@@ -1357,7 +1447,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       details: {
         source: "recovery.scan_silent_active_runs",
         evaluationIssueId: input.evaluationIssue.id,
-        blockerIssueIds: nextBlockerIds,
       },
     });
     return true;
@@ -1391,6 +1480,53 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
       return { kind: "skipped" as const };
     }
+
+    // Idle output is expected when the source issue is blocked — skip ticket creation entirely.
+    if (sourceIssue?.status === "blocked") return { kind: "skipped" as const };
+
+    // Dedup: if a reviewer has dismissed this run's silence as a false positive, don't re-file.
+    // A "continue" decision with a snooze window is allowed to re-arm normally — only an
+    // explicit dismissed_false_positive blocks all further alerts for this run.
+    if (await hasDismissedFalsePositiveDecision(input.run.companyId, input.run.id)) {
+      return { kind: "skipped" as const };
+    }
+
+    // Dedup: if a prior evaluation issue for this run was closed (done/cancelled) on the board
+    // without going through the watchdog decision API, no dismissed_false_positive record exists
+    // and the watchdog would re-fire every cycle. Auto-record the suppression now so future
+    // cycles skip immediately via hasDismissedFalsePositiveDecision.
+    //
+    // Exception: if any watchdog decision exists (snooze/continue), a human explicitly opted
+    // in to the watchdog lifecycle — honour that and allow re-arm as designed.
+    const closedEvaluation = await findClosedStaleRunEvaluation(input.run.companyId, input.run.id);
+    if (closedEvaluation) {
+      const hasAnyDecision = await db
+        .select({ id: heartbeatRunWatchdogDecisions.id })
+        .from(heartbeatRunWatchdogDecisions)
+        .where(
+          and(
+            eq(heartbeatRunWatchdogDecisions.companyId, input.run.companyId),
+            eq(heartbeatRunWatchdogDecisions.runId, input.run.id),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0);
+      if (!hasAnyDecision) {
+        await db.insert(heartbeatRunWatchdogDecisions).values({
+          companyId: input.run.companyId,
+          runId: input.run.id,
+          evaluationIssueId: closedEvaluation.id,
+          decision: "dismissed_false_positive",
+          snoozedUntil: null,
+          reason: `Auto-recorded: evaluation issue ${closedEvaluation.identifier} was closed as ${closedEvaluation.status} on the board without a watchdog decision.`,
+          createdByAgentId: null,
+          createdByUserId: null,
+          createdByRunId: null,
+        });
+        return { kind: "skipped" as const };
+      }
+    }
+
     const silenceStartedAt = silenceStartedAtForRun(input.run);
     if (sourceIssue && isTerminalIssueStatus(sourceIssue.status)) {
       const terminalEvidence = await latestSameRunSourceTerminalEvidence({
@@ -2375,6 +2511,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       orphanBlockersAssigned: 0,
       successfulRunHandoffEscalated: 0,
       escalated: 0,
+      recentProgressExempted: 0,
       skipped: 0,
       issueIds: [] as string[],
     };
@@ -2528,21 +2665,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
-          const updated = await escalateStrandedAssignedIssue({
-            issue,
-            previousStatus: "in_progress",
-            latestRun: successfulRun,
-            comment:
-              "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
-              "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
-          });
-          if (updated) {
-            result.escalated += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
+          // GGU-809: skip escalation if the assignee has shown visible progress
+          // (comment or attachment) within the exemption window. Falling
+          // through here lets the normal continuation-retry path enqueue the
+          // next wake, which is the correct behaviour for batch workflows.
+          const exempted = await hasRecentVisibleProgress(
+            issue.companyId,
+            issue.id,
+            agentId,
+            STRANDED_RECENT_PROGRESS_EXEMPTION_MS,
+          );
+          if (!exempted) {
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "in_progress",
+              latestRun: successfulRun,
+              comment:
+                "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
+                "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
           }
-          continue;
+          result.recentProgressExempted += 1;
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
