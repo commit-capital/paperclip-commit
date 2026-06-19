@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -7668,6 +7668,96 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.sweepStaleIssueLocks();
   }
 
+  async function sweepStaleExecutionLocks() {
+    const TERMINAL_STATUSES = ["succeeded", "failed", "timed_out", "cancelled", "process_lost"];
+
+    const staleIssues = await db.execute(sql`
+      SELECT i.id, i.identifier, i.execution_run_id
+      FROM issues i
+      WHERE i.execution_run_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM heartbeat_runs hr
+          WHERE hr.id = i.execution_run_id
+            AND hr.status NOT IN (${sql.join(TERMINAL_STATUSES.map((s) => sql`${s}`), sql`, `)})
+        )
+    `);
+
+    if (staleIssues.length === 0) return { cleared: 0 };
+
+    const staleIds = staleIssues.map((r: Record<string, unknown>) => r.id as string);
+
+    await db
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(inArray(issues.id, staleIds));
+
+    logger.info(
+      { count: staleIds.length, issueIds: staleIds },
+      "swept stale execution locks from issues pointing to terminal/missing runs",
+    );
+
+    return { cleared: staleIds.length };
+  }
+
+  async function sweepOrphanedExecutionLocks(opts?: { staleThresholdMs?: number }) {
+    const staleThresholdMs = opts?.staleThresholdMs ?? 60 * 60 * 1000;
+    const staleCutoff = new Date(Date.now() - staleThresholdMs);
+
+    const candidates = await db
+      .select({
+        issueId: issues.id,
+        companyId: issues.companyId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+        runStatus: heartbeatRuns.status,
+      })
+      .from(issues)
+      .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, issues.executionRunId))
+      .where(
+        and(
+          isNotNull(issues.executionRunId),
+          or(
+            inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out"]),
+            and(
+              lt(issues.executionLockedAt, staleCutoff),
+              or(
+                sql`${heartbeatRuns.id} IS NULL`,
+                sql`${heartbeatRuns.status} NOT IN ('queued', 'running')`,
+              ),
+            ),
+          ),
+        ),
+      );
+
+    if (candidates.length === 0) {
+      return { cleaned: 0, issueIds: [] };
+    }
+
+    const updateResults = await Promise.all(
+      candidates.map((c) =>
+        db
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(issues.id, c.issueId), eq(issues.executionRunId, c.executionRunId!)))
+          .returning({ id: issues.id }),
+      ),
+    );
+
+    const clearedIssueIds = updateResults.flatMap((r) => r.map((row) => row.id));
+
+    return { cleaned: clearedIssueIds.length, issueIds: clearedIssueIds };
+  }
+
   function issueIdFromRunContext(contextSnapshot: unknown) {
     const context = parseObject(contextSnapshot);
     return readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -11618,6 +11708,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileStrandedAssignedIssues,
 
     sweepStaleIssueLocks,
+
+    sweepStaleExecutionLocks,
+
+    sweepOrphanedExecutionLocks,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 

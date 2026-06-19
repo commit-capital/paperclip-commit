@@ -13,12 +13,6 @@ export function assertBoard(req: Request) {
   }
 }
 
-export function assertBoardOrAgent(req: Request) {
-  if (req.actor.type !== "board" && req.actor.type !== "agent") {
-    throw forbidden("Board or agent access required");
-  }
-}
-
 export function hasBoardOrgAccess(req: Request) {
   if (req.actor.type !== "board") {
     return false;
